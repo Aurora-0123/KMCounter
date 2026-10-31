@@ -1,0 +1,6 @@
+{
+  "version": "4.2.0",
+  "bundle": "cartesian",
+  "source": "https://cdn.plot.ly/plotly-cartesian-4.2.0.min.js",
+  "sha256": "71f93d302d8da7fe46ee9ca4cde3ddd2da65291782500ad323c500d27c8fa7c3"
+}

@@ -1,91 +1,189 @@
+"""Local aggregate storage. Never store event sequences or arbitrary text."""
+from __future__ import annotations
+
 from datetime import datetime
-from random import choice
-import platform
-import string
-import shutil
+import hashlib
 import json
 import os
+from pathlib import Path
+import platform
+import re
+import tempfile
+import threading
 
-os_type = platform.system() # Windows, Darwin
-# print(os_type)
-date_format = '%Y-%m-%d'
-time_format = '%Y-%m-%d %H:%M'
+VERSION = '2.0.0'
+TIME_FORMAT = '%Y-%m-%d %H:%M'
+os_type = platform.system()
+_SHIFTED = dict(zip('~!@#$%^&*()_+{}|:"<>?', '`1234567890-=[]\\;\',./'))
+_SPECIAL = set(('alt alt_l alt_r alt_gr backspace caps_lock cmd cmd_l cmd_r ctrl '
+                'ctrl_l ctrl_r delete down end enter esc home insert left menu '
+                'num_lock page_down page_up pause print_screen right scroll_lock '
+                'shift shift_l shift_r space tab up media_volume_mute media_volume_down '
+                'media_volume_up media_play_pause media_next media_previous unknown').split())
+_SPECIAL.update(f'f{n}' for n in range(1, 25))
+_BUTTON = re.compile(r'^Button\.(?:left|right|middle|x1|x2)(?:_position_-?\d+_-?\d+)?$')
 
-version = '1.2.0'
 
-settings_file = os.path.join('.', 'settings.json')
+def normalize_key(key: str) -> str:
+    if _BUTTON.fullmatch(key):
+        if '_position_' in key:
+            button, position = key.split('_position_')
+            x, y = map(int, position.split('_'))
+            return f'{button}_position_{max(0, min(99, x))}_{max(0, min(99, y))}'
+        return key
+    if key == 'Key.shift_l':
+        return 'Key.shift'
+    if key.startswith('Key.') and key[4:] in _SPECIAL:
+        return key
+    if len(key) == 1:
+        if 1 <= ord(key) <= 26:
+            return chr(ord(key) + 64)
+        if key.isascii() and key.isalpha():
+            return key.upper()
+        if key in _SHIFTED:
+            return _SHIFTED[key]
+        if key in "0123456789`-=[]\\;',./":
+            return key
+    return 'Key.unknown'
 
-data_file = os.path.join('.', 'data.json') # 弃用
-data_file_dir = os.path.join('.', 'data')
 
-def generate_random_string(length):
-    characters = string.ascii_letters + string.digits
-    return ''.join(choice(characters) for _ in range(length))
+def normalize_history(value: object) -> dict:
+    if not isinstance(value, dict):
+        raise ValueError('Invalid history')
+    result = {}
+    for minute, counts in value.items():
+        if not isinstance(minute, str) or datetime.strptime(minute, TIME_FORMAT).strftime(TIME_FORMAT) != minute:
+            raise ValueError('Invalid minute')
+        if not isinstance(counts, dict):
+            raise ValueError('Invalid counts')
+        result[minute] = {}
+        for name, count in counts.items():
+            if not isinstance(name, str) or type(count) is not int or count < 0:
+                raise ValueError('Invalid count')
+            if count:
+                key = normalize_key(name)
+                result[minute][key] = result[minute].get(key, 0) + count
+    return result
 
-def copy_file(src, dst):
-    shutil.copyfile(src, dst)
-    # with open(src, 'rb') as f_src:
-    #     with open(dst, 'wb') as f_dst:
-    #         f_dst.write(f_src.read())
 
-def time_it(func): # 测试用
-    def wrapper(*args, **kwargs):
-        start_time = datetime.now()
-        result = func(*args, **kwargs)
-        end_time = datetime.now()
-        print(f"'{func.__name__}()' runtime: {end_time - start_time}")
-        return result
-    return wrapper
+def atomic_json(path: Path, value: object) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=path.parent,
+                                         prefix=path.name + '.', suffix='.tmp', delete=False) as f:
+            temporary = Path(f.name)
+            json.dump(value, f, ensure_ascii=True, sort_keys=True, separators=(',', ':'))
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
-def get_date():
-    return datetime.now().strftime(date_format)
 
-def get_time():
-    return datetime.now().strftime(time_format)
+class StatsStore:
+    def __init__(self, directory: Path, clock=datetime.now):
+        self.directory = Path(directory)
+        self.directory.mkdir(parents=True, exist_ok=True)
+        self.clock = clock
+        self.lock = threading.RLock()
+        self._days = {}
+        self._dirty = set()
+        self._errors = {}
+        self.paused = False
 
-def get_data_path(date = datetime.now().strftime(date_format)):
-    return os.path.join(data_file_dir, f'{date}.json')
+    @property
+    def errors(self):
+        with self.lock:
+            return list(self._errors.values())
 
-def load_settings(settings, settings_file):
-    if os.path.exists(settings_file):
-        with open(settings_file, 'r', encoding='utf-8') as f:
-            if f.read() == '':
-                settings = {}
-            else:
-                f.seek(0)
-                settings = json.load(f)
-    else:
-        settings = {'track_keyboard': True, 'track_mouse': True}
-    return settings
+    def _load(self, day):
+        if day not in self._days:
+            path = self.directory / f'{day}.json'
+            try:
+                value = normalize_history(json.loads(path.read_text(encoding='utf-8'))) if path.exists() else {}
+                if any(not minute.startswith(day + ' ') for minute in value):
+                    raise ValueError('History date mismatch')
+                self._days[day] = value
+                self._errors.pop(day, None)
+            except (OSError, ValueError, TypeError):
+                self._errors[day] = f'无法读取 {day}.json；已保留原文件，请检查或从备份恢复。'
+                raise ValueError('Unable to read history') from None
+        return self._days[day]
 
-def save_settings(settings, settings_file):
-    with open(settings_file, 'w', encoding='utf-8') as f:
-        json.dump(settings, f)
+    def _count(self, keys):
+        with self.lock:
+            if self.paused:
+                return
+            now = self.clock()
+            day, minute = now.strftime('%Y-%m-%d'), now.strftime(TIME_FORMAT)
+            counts = self._load(day).setdefault(minute, {})
+            for key in keys:
+                counts[key] = counts.get(key, 0) + 1
+            self._dirty.add(day)
 
-def load_data(data_file):
-    if os.path.exists(data_file):
-        with open(data_file, 'r', encoding='utf-8') as f:
-            if f.read() == '':
-                data = {}
-            else:
-                f.seek(0)
-                data = json.load(f)
-    else:
-        data = {}
-    return data
+    def count_key(self, name):
+        self._count([normalize_key(name)])
 
-# @time_it
-def save_data(data, data_file):
-    if os.path.exists(data_file):
-        tmp_data_file = f'{data_file}.{generate_random_string(8)}.tmp' # 避免程序中断，data文件未写完
-        copy_file(data_file, tmp_data_file)
-        with open(tmp_data_file, 'w', encoding='utf-8') as f:
-            json.dump(data, f)
-        copy_file(tmp_data_file, data_file)
-        try:
-            os.remove(tmp_data_file)
-        except Exception as e:
-            print('Error: ', e)
-    else:
-        with open(data_file, 'w', encoding='utf-8') as f:
-            json.dump(data, f)
+    def count_click(self, button, x, y, bounds):
+        if button not in {'Button.left', 'Button.right', 'Button.middle', 'Button.x1', 'Button.x2'}:
+            return
+        left, top, width, height = bounds
+        px = max(0, min(99, int((x - left) / max(1, width) * 100)))
+        py = max(0, min(99, int((y - top) / max(1, height) * 100)))
+        self._count([button, f'{button}_position_{px}_{py}'])
+
+    def set_paused(self, paused):
+        with self.lock:
+            self.paused = bool(paused)
+            self.flush()
+
+    def flush(self):
+        with self.lock:
+            for day in sorted(self._dirty):
+                try:
+                    atomic_json(self.directory / f'{day}.json', self._days[day])
+                except OSError:
+                    self._errors['write:' + day] = f'保存 {day}.json 失败；内存统计仍保留，将继续重试。'
+                    raise
+                else:
+                    self._errors.pop('write:' + day, None)
+                    self._dirty.remove(day)
+
+    def snapshot(self):
+        with self.lock:
+            days = set(self._days)
+            days.update(p.stem for p in self.directory.glob('????-??-??.json'))
+            result = {}
+            for day in sorted(days):
+                try:
+                    result.update({minute: dict(counts) for minute, counts in self._load(day).items()})
+                except ValueError:
+                    continue
+            return dict(sorted(result.items()))
+
+    def import_legacy(self, source, sample_hashes=()):
+        source = Path(source)
+        if not source.exists() or source.resolve() == self.directory.resolve():
+            return
+        with self.lock:
+            for path in sorted(source.glob('????-??-??.json')):
+                try:
+                    raw = path.read_bytes()
+                    if hashlib.sha256(raw).hexdigest() in sample_hashes:
+                        continue
+                    incoming = normalize_history(json.loads(raw))
+                    if any(not minute.startswith(path.stem + ' ') for minute in incoming):
+                        raise ValueError('Date mismatch')
+                    current = self._load(path.stem)
+                    # Max merge is idempotent even after a crash between imports.
+                    for minute, counts in incoming.items():
+                        target = current.setdefault(minute, {})
+                        for key, count in counts.items():
+                            target[key] = max(target.get(key, 0), count)
+                    self._dirty.add(path.stem)
+                    self.flush()
+                    self._errors.pop('import:' + path.name, None)
+                except (OSError, ValueError, TypeError):
+                    self._errors['import:' + path.name] = f'未能导入 {path.name}；原始记录已保留。'

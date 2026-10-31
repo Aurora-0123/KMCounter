@@ -1,77 +1,112 @@
-from flask import Flask, render_template, jsonify, request
+"""Loopback-only dashboard and protected application controls."""
 from datetime import datetime
+import hmac
 import math
+import secrets
 
-from utils import *
+from flask import Flask, abort, jsonify, render_template, request
 
-app = Flask(__name__)
+from utils import TIME_FORMAT, VERSION, os_type
 
-def fetch_range_data(start_time=None, end_time=None):
-    data = {}
-    for file in os.listdir(data_file_dir):
-        if file.endswith('.json'):
-            date = datetime.strptime(file.split('.')[0], '%Y-%m-%d')
-            if start_time:
-                start_time = start_time.replace(hour=0, minute=0, second=0)
-                # print(start_time, date, start_time > date)
-                if start_time > date:
-                    continue
-            if end_time:
-                end_time = end_time.replace(hour=0, minute=0, second=0)
-                # print(end_time, date, end_time < date)
-                if end_time < date:
-                    continue
-            data.update(load_data(os.path.join(data_file_dir, file)))
-    return data
+HOST = '127.0.0.1:5000'
+BASE_URL = 'http://' + HOST
 
-@app.route('/')
-def index():
-    data = {}
-    for file in os.listdir(data_file_dir):
-        if file.endswith('.json'):
-            data.update(load_data(os.path.join(data_file_dir, file)))
-            # date = file.split('.')[0]
-            # print(date)
-    return render_template('index.html', data=data, os_type=os_type)
 
-@app.route('/fetch_key_counts', methods=['POST'])
-def fetch_key_counts():
-    request_json = request.json
-    start_time = datetime.strptime(str(request_json.get('start_time')), '%Y-%m-%dT%H:%M')
-    end_time = datetime.strptime(str(request_json.get('end_time')), '%Y-%m-%dT%H:%M')
-    
-    data = fetch_range_data(start_time, end_time)
-    filtered_data = {time: counts for time, counts in data.items() if start_time <= datetime.strptime(time, time_format) <= end_time}
-    merge_keys = {'~': '`', '!': '1', '@': '2', '#': '3', '$': '4', '%': '5', '^': '6', '&': '7', '*': '8', '(': '9', ')': '0', '_': '-', '+': '=', 
-                  'q': 'Q', 'w': 'W', 'e': 'E', 'r': 'R', 't': 'T', 'y': 'Y', 'u': 'U', 'i': 'I', 'o': 'O', 'p': 'P','{': '[', '}': ']', '|': '\\',
-                  'a': 'A', 's': 'S', 'd': 'D', 'f': 'F', 'g': 'G', 'h': 'H', 'j': 'J', 'k': 'K', 'l': 'L', ':': ';', '"\'"': "'", '"': "'",
-                  'z': 'Z', 'x': 'X', 'c': 'C', 'v': 'V', 'b': 'B', 'n': 'N', 'm': 'M', '<': ',', '>': '.', '?': '/'}
-    key_counts = {}
-    for counts in filtered_data.values():
-        for key, count in counts.items():
-            merged_key = merge_keys.get(key, key)
-            if merged_key in key_counts:
-                key_counts[merged_key] += count
+def create_app(store, controller):
+    app = Flask(__name__)
+    app.config.update(CONTROL_TOKEN=secrets.token_urlsafe(32), MAX_CONTENT_LENGTH=4096,
+                      DEBUG=False, TESTING=False)
+
+    @app.before_request
+    def local_only():
+        if request.host != HOST:
+            abort(403)
+        origin = request.headers.get('Origin')
+        if origin and origin != BASE_URL:
+            abort(403)
+        if request.headers.get('Sec-Fetch-Site') == 'cross-site':
+            abort(403)
+        if request.path.startswith('/control/') or request.path == '/end_program':
+            token = request.headers.get('X-KMCounter-Token', '')
+            if origin != BASE_URL or not hmac.compare_digest(token, app.config['CONTROL_TOKEN']):
+                abort(403)
+
+    @app.after_request
+    def private_headers(response):
+        response.headers['Cache-Control'] = 'no-store'
+        response.headers['X-Content-Type-Options'] = 'nosniff'
+        response.headers['Referrer-Policy'] = 'no-referrer'
+        response.headers['Content-Security-Policy'] = (
+            "default-src 'self'; script-src 'self' 'unsafe-inline'; "
+            "style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; "
+            "connect-src 'self'; font-src 'self' data:; object-src 'none'; "
+            "frame-ancestors 'none'; form-action 'self'; base-uri 'none'"
+        )
+        return response
+
+    @app.errorhandler(400)
+    @app.errorhandler(403)
+    @app.errorhandler(413)
+    def request_error(error):
+        return jsonify(error='请求无效或未获授权。请从托盘重新打开统计页。'), error.code
+
+    @app.get('/')
+    def index():
+        return render_template('index.html', os_type=os_type, version=VERSION,
+                               control_token=app.config['CONTROL_TOKEN'])
+
+    @app.get('/status')
+    def status():
+        return jsonify(controller.status())
+
+    @app.post('/fetch_key_counts')
+    def fetch_key_counts():
+        payload = request.get_json(silent=True)
+        try:
+            if not isinstance(payload, dict):
+                raise ValueError
+            start = datetime.strptime(payload.get('start_time', ''), '%Y-%m-%dT%H:%M')
+            end = datetime.strptime(payload.get('end_time', ''), '%Y-%m-%dT%H:%M')
+            if start > end:
+                raise ValueError
+        except (TypeError, ValueError):
+            return jsonify(error='请选择有效的起止时间，开始时间不能晚于结束时间。'), 400
+        counts = {}
+        for minute, values in store.snapshot().items():
+            if start <= datetime.strptime(minute, TIME_FORMAT) <= end:
+                for key, count in values.items():
+                    counts[key] = counts.get(key, 0) + count
+        rates = {}
+        for mouse in (False, True):
+            group = {key: value for key, value in counts.items()
+                     if key.startswith('Button.') == mouse and '_position_' not in key}
+            maximum = max(group.values(), default=0)
+            rates.update({key: math.log1p(value) / math.log1p(maximum)
+                          for key, value in group.items() if maximum})
+        rates.update({key: 0 for key in counts if '_position_' in key})
+        return jsonify(counts, rates)
+
+    @app.get('/fetch_total_key_counts')
+    def fetch_total_key_counts():
+        return jsonify({minute: sum(n for key, n in counts.items() if '_position_' not in key)
+                        for minute, counts in store.snapshot().items()})
+
+    @app.post('/control/<action>')
+    def control(action):
+        try:
+            if action in ('pause', 'resume'):
+                controller.set_paused(action == 'pause')
+            elif action == 'stop':
+                controller.request_stop()
             else:
-                key_counts[merged_key] = count
-    max_count_k = max(count for key, count in key_counts.items() if not key.startswith('Button.'))
-    max_count_m = max(count for key, count in key_counts.items() if key.startswith('Button.'))
-    key_counts_rate = {key: math.log(count, max_count_k) for key, count in key_counts.items() if not key.startswith('Button.')}
-    key_counts_rate.update({key: math.log(count, max_count_m) for key, count in key_counts.items() if key.startswith('Button.')})
-    # print(key_counts_rate)
-    return jsonify(key_counts, key_counts_rate)
+                abort(404)
+        except OSError:
+            return jsonify(error='保存统计失败，请检查数据目录权限或可用空间。'), 503
+        return jsonify(ok=True, **controller.status())
 
-@app.route('/fetch_total_key_counts')
-def fetch_total_key_counts():
-    data = fetch_range_data()
-    total_key_counts = {time: sum(counts.values()) for time, counts in data.items()}
-    # print(total_key_counts)
-    return jsonify(total_key_counts)
+    @app.post('/end_program')
+    def end_program():
+        controller.request_stop()
+        return jsonify(ok=True)
 
-@app.route('/end_program', methods=['POST'])
-def end_program():
-    os._exit(0)
-
-def run_frontend():
-    # app.run(debug=True)
-    app.run()
+    return app

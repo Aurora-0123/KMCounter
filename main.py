@@ -1,81 +1,88 @@
-from pynput import keyboard, mouse
-import pyautogui
+"""KMCounter Windows desktop entry point."""
+import argparse
+import json
+import logging
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
+import sys
+import time
+import urllib.error
+import urllib.request
 import webbrowser
 
-from utils import *
-from display import run_frontend
+from display import BASE_URL, create_app
+from runtime import Controller, SingleInstance, local_appdata, set_autostart, show_error
+from utils import StatsStore
 
-settings = {}
-data = {}
 
-def k_on_press(key):
-    date = get_date()
-    time = get_time()
-    if date not in data:
-        data[date] = {}
-    if time not in data[date]:
-        data[date][time] = {}
-    key = str(key).strip("'")
-    if key in data[date][time]:
-        data[date][time][key] += 1
-    else:
-        data[date][time][key] = 1
-    save_data(data[date], get_data_path(date))
+def open_existing():
+    # Bypass proxies: this is exclusively a loopback connection.
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    for _ in range(50):
+        try:
+            with opener.open(BASE_URL + '/status', timeout=0.3) as response:
+                state = json.load(response)
+            if state.get('version') == '2.0.0' and state.get('running'):
+                webbrowser.open(BASE_URL)
+                return
+        except (OSError, ValueError):
+            pass
+        time.sleep(0.1)
+    raise OSError('已运行的实例没有响应，请检查托盘或退出旧实例后重试。')
 
-def m_on_click(x, y, button, pressed):
-    if pressed:
-        date = get_date()
-        time = get_time()
-        if date not in data:
-            data[date] = {}
-        if time not in data[date]:
-            data[date][time] = {}
-            
-        name_button = str(button)
-        screen_width, screen_height = pyautogui.size()
-        name_position = f'{name_button}_position_{int(x / screen_width * 100)}_{int(y / screen_height * 100)}'
-        
-        if name_button in data[date][time]:
-            data[date][time][name_button] += 1
-        else:
-            data[date][time][name_button] = 1
-        if name_position in data[date][time]:
-            data[date][time][name_position] += 1
-        else:
-            data[date][time][name_position] = 1
-            
-        save_data(data[date], get_data_path(date))
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description='本机键盘与鼠标统计')
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument('--background', action='store_true', help='后台运行，不打开网页')
+    mode.add_argument('--show', action='store_true', help='打开统计页')
+    parser.add_argument('--data-dir', type=Path, help='使用指定数据目录')
+    parser.add_argument('--import-data', action='append', type=Path, default=[], help='导入旧版 data 目录')
+    parser.add_argument('--enable-autostart', action='store_true', help='启用当前用户登录启动')
+    parser.add_argument('--disable-autostart', action='store_true', help='关闭登录启动并退出')
+    args = parser.parse_args(argv)
+    instance = SingleInstance()
+    try:
+        if args.disable_autostart:
+            set_autostart(False)
+            return 0
+        if not instance.acquire():
+            if args.import_data or args.enable_autostart:
+                raise OSError('程序正在运行。请先从托盘退出，再安装或导入历史记录。')
+            if not args.background:
+                open_existing()
+            return 0
+        root = local_appdata() / 'KMCounter'
+        directory = args.data_dir.resolve() if args.data_dir else root / 'data'
+        directory.mkdir(parents=True, exist_ok=True)
+        handler = RotatingFileHandler(directory.parent / 'kmcounter.log', maxBytes=256_000,
+                                      backupCount=2, encoding='utf-8')
+        handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(message)s'))
+        logging.getLogger().addHandler(handler)
+        logging.getLogger().setLevel(logging.WARNING)
+        store = StatsStore(directory)
+        samples_path = Path(__file__).with_name('sample-hashes.json')
+        samples = json.loads(samples_path.read_text(encoding='utf-8'))
+        for source in args.import_data:
+            store.import_legacy(source, samples)
+        store.snapshot()  # Detect damaged history before listeners start.
+        if args.enable_autostart:
+            set_autostart(True)
+        controller = Controller(store)
+        app = create_app(store, controller)
+        controller.run(app, show=not args.background)
+        return 0
+    except (OSError, ValueError) as error:
+        logging.getLogger('kmcounter').error('Application could not start or finish saving.')
+        # Native message must be actionable; never include captured input.
+        message = str(error) if isinstance(error, ValueError) else (
+            '程序无法启动或保存。请检查是否已有程序占用 127.0.0.1:5000、数据目录权限和磁盘空间。\n'
+            '如果刚刚执行了安装或导入，请先退出已有的 KMCounter 实例。')
+        show_error(message)
+        return 1
+    finally:
+        instance.close()
+
 
 if __name__ == '__main__':
-    date = get_date()
-    if os.path.exists(data_file) and not os.path.exists(data_file_dir): # v1.0->v1.1 迁移数据
-        copy_file(data_file, data_file + '.bak') # 备份数据
-        os.mkdir(data_file_dir)
-        data = load_data(os.path.join('.', 'data.json'))
-        new_data = {}
-        for key in data.keys():
-            date = key[0:10]
-            if date not in new_data:
-                new_data[date] = {}
-            new_data[date][key] = data[key]
-        for date in new_data:
-            save_data(new_data[date], get_data_path(date))
-    data[date] = load_data(get_data_path(date))
-    if os.path.exists(get_data_path(date)):
-        copy_file(get_data_path(date), get_data_path(date) + '.bak') # 备份数据
-    else:
-        if not os.path.exists(data_file_dir):
-            os.mkdir(data_file_dir)
-        data[date] = {}
-    for file_name in os.listdir(data_file_dir):
-        if file_name.endswith('.tmp'):
-            # print(os.path.join(data_file_dir, file_name))
-            os.remove(os.path.join(data_file_dir, file_name))
-    # print('\n\n\ntest\n\n\n')
-    # settings = load_settings(settings, settings_file)
-    listener_k = keyboard.Listener(on_press=k_on_press)
-    listener_k.start()
-    listener_m = mouse.Listener(on_click=m_on_click)
-    listener_m.start()
-    webbrowser.open('http://127.0.0.1:5000')
-    run_frontend()
+    sys.exit(main())
