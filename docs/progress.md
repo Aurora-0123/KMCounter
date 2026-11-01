@@ -43,3 +43,21 @@
 - Live mouse click via the desktop skill increased both button and heatmap counts.
   Native keyboard capture, pause/resume, periodic saving and duplicate launch were
   also tested. Actual re-login remains unverified; no logoff/reboot was performed.
+- 2026-11-01 follow-up: reboot did not start the app. Direct Run reads disagreed
+  with Windows StdRegProv/Win32_StartupCommand. Manual command from System32 worked.
+  Fixed both installer and runtime startup writes to use and verify the system
+  registry provider, retaining the local view for consistency. Added lifecycle logs.
+  New tests reproduced missing provider registration and missing startup logging.
+- Focused review found that status still trusted the isolated direct view and
+  disable unnecessarily constructed a startup command. Reproduced both, plus
+  missing-key removal, then fixed: status queries the system provider (30-second
+  cache to avoid repeated helper launches); disable is idempotent and needs no
+  executable command. All 26 nonbrowser tests passed after the review fixes.
+- With all reads now authoritative, removed the redundant direct-view mirror.
+  System-provider enable/disable/readback were live-tested: Windows recognized the
+  enabled entry, removal disappeared from Win32_StartupCommand, and restoration
+  reappeared. Lifecycle logs confirmed app startup and tray readiness.
+- Final follow-up verification: 27/27 tests passed after all fixes; rebuilt the
+  windowless distribution and updated the installed app without importing or
+  deleting statistics. System-side registration and live health checked again.
+  The next actual Windows login still requires user-side observation.

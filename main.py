@@ -60,6 +60,8 @@ def main(argv=None):
         handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(message)s'))
         logging.getLogger().addHandler(handler)
         logging.getLogger().setLevel(logging.WARNING)
+        logging.getLogger('kmcounter').setLevel(logging.INFO)
+        logging.getLogger('kmcounter').info('Application startup requested (background=%s).', args.background)
         store = StatsStore(directory)
         samples_path = Path(__file__).with_name('sample-hashes.json')
         samples = json.loads(samples_path.read_text(encoding='utf-8'))
@@ -71,6 +73,7 @@ def main(argv=None):
         controller = Controller(store)
         app = create_app(store, controller)
         controller.run(app, show=not args.background)
+        logging.getLogger('kmcounter').info('Statistics saved; application stopped.')
         return 0
     except (OSError, ValueError) as error:
         logging.getLogger('kmcounter').error('Application could not start or finish saving.')

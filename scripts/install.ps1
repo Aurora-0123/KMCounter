@@ -56,6 +56,7 @@ $arguments = @('--background', '--enable-autostart')
 if ($LegacyData) {
     $arguments += @('--import-data', ('"' + [IO.Path]::GetFullPath($LegacyData) + '"'))
 }
+Register-KMCounterStartup $executable
 $launched = Start-Process -FilePath $executable -ArgumentList $arguments -WorkingDirectory $destination -WindowStyle Hidden -PassThru
 $ready = $false
 for ($attempt = 0; $attempt -lt 40; $attempt++) {

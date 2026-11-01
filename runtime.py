@@ -10,6 +10,7 @@ from pathlib import Path
 import subprocess
 import sys
 import threading
+import time
 import webbrowser
 
 from display import BASE_URL
@@ -18,6 +19,8 @@ from utils import VERSION, normalize_key
 LOG = logging.getLogger('kmcounter')
 RUN_KEY = r'Software\Microsoft\Windows\CurrentVersion\Run'
 RUN_NAME = 'KMCounter'
+_startup_cache = None
+_startup_lock = threading.Lock()
 _OEM_KEYS = {186: ';', 187: '=', 188: ',', 189: '-', 190: '.', 191: '/',
              192: '`', 219: '[', 220: '\\', 221: ']', 222: "'", 226: '\\'}
 
@@ -52,26 +55,46 @@ def startup_command(executable=None):
     return command
 
 
-def autostart_enabled():
-    import winreg
+def _startup_helper(action, command=''):
+    helper = (Path(sys.executable).parent / 'installer-functions.ps1' if getattr(sys, 'frozen', False)
+              else Path(__file__).parent / 'scripts' / 'installer-functions.ps1')
     try:
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as key:
-            value, _ = winreg.QueryValueEx(key, RUN_NAME)
-        return value == startup_command()
-    except FileNotFoundError:
+        result = subprocess.run(
+            ['powershell.exe', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+             '-File', str(helper), '-StartupAction', action],
+            env={**os.environ, 'KMC_STARTUP_COMMAND': command},
+            capture_output=True, timeout=20, creationflags=subprocess.CREATE_NO_WINDOW)
+    except (OSError, subprocess.TimeoutExpired):
+        raise OSError('Windows 无法更新登录启动设置，请检查当前用户的权限。') from None
+    if result.returncode:
+        raise OSError('Windows 未能确认登录启动设置已更新。')
+    return result
+
+
+def autostart_enabled():
+    global _startup_cache
+    try:
+        command = startup_command()
+    except ValueError:
         return False
+    with _startup_lock:
+        # Status is polled by both the page and tray; avoid spawning a helper on
+        # every poll while still noticing outside changes within thirty seconds.
+        if _startup_cache and _startup_cache[0] == command and time.monotonic() < _startup_cache[1]:
+            return _startup_cache[2]
+        answer = _startup_helper('Check', command).stdout.strip()
+        if answer not in (b'enabled', b'disabled'):
+            raise OSError('Windows 未能读取登录启动设置。')
+        enabled = answer == b'enabled'
+        _startup_cache = (command, time.monotonic() + 30, enabled)
+        return enabled
 
 
 def set_autostart(enabled):
-    import winreg
-    with winreg.CreateKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as key:
-        if enabled:
-            winreg.SetValueEx(key, RUN_NAME, 0, winreg.REG_SZ, startup_command())
-        else:
-            try:
-                winreg.DeleteValue(key, RUN_NAME)
-            except FileNotFoundError:
-                pass
+    global _startup_cache
+    _startup_helper('Enable' if enabled else 'Disable', startup_command() if enabled else '')
+    with _startup_lock:
+        _startup_cache = None
 
 
 class SingleInstance:
@@ -268,6 +291,7 @@ class Controller:
             self.refresh_tray()
 
             def tray_ready(icon):
+                LOG.info('Tray message loop ready.')
                 if not self.stop_event.is_set():
                     icon.visible = True
                 # pystray.stop is effective only after its message loop starts.
